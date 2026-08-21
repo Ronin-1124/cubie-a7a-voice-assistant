@@ -1,0 +1,286 @@
+{
+  "meta": {
+    "host": "radxa-cubie-a7a",
+    "kernel": "5.15.147-21-a733",
+    "machine": "aarch64",
+    "cpus": 8,
+    "cpu_map": [
+      {
+        "id": "0",
+        "part": "0xd05",
+        "name": "Cortex-A55"
+      },
+      {
+        "id": "1",
+        "part": "0xd05",
+        "name": "Cortex-A55"
+      },
+      {
+        "id": "2",
+        "part": "0xd05",
+        "name": "Cortex-A55"
+      },
+      {
+        "id": "3",
+        "part": "0xd05",
+        "name": "Cortex-A55"
+      },
+      {
+        "id": "4",
+        "part": "0xd05",
+        "name": "Cortex-A55"
+      },
+      {
+        "id": "5",
+        "part": "0xd05",
+        "name": "Cortex-A55"
+      },
+      {
+        "id": "6",
+        "part": "0xd0b",
+        "name": "Cortex-A76"
+      },
+      {
+        "id": "7",
+        "part": "0xd0b",
+        "name": "Cortex-A76"
+      }
+    ],
+    "mem_mb": {
+      "MemTotal": 5913.8,
+      "MemFree": 4746.5,
+      "MemAvailable": 5483.2
+    },
+    "date": "2026-08-11 07:17:58"
+  },
+  "load": {
+    "rss_before_mb": 32.2,
+    "kws_load_s": 2.118,
+    "rss_after_kws_mb": 70.6,
+    "asr_load_s": 2.576,
+    "rss_after_both_mb": 128.7,
+    "delta_kws_mb": 38.4,
+    "delta_asr_mb": 58.1,
+    "total_load_s": 4.694
+  },
+  "kws": [
+    {
+      "file": "samples/wake_nihao_xiaorui_16k.wav",
+      "dur_s": 1.776,
+      "hits": [
+        "你好小瑞"
+      ],
+      "decode_mean_s": 0.1888,
+      "decode_std_s": 0.0003,
+      "rtf_mean": 0.1063
+    },
+    {
+      "file": "samples/wake_xiaorui_16k.wav",
+      "dur_s": 1.776,
+      "hits": [
+        "小瑞"
+      ],
+      "decode_mean_s": 0.1887,
+      "decode_std_s": 0.0006,
+      "rtf_mean": 0.1062
+    },
+    {
+      "file": "samples/wake_xiaorui_xiaorui_16k.wav",
+      "dur_s": 1.776,
+      "hits": [
+        "小瑞",
+        "小瑞"
+      ],
+      "decode_mean_s": 0.1887,
+      "decode_std_s": 0.0005,
+      "rtf_mean": 0.1062
+    },
+    {
+      "file": "samples/wake_nihao_16k.wav",
+      "dur_s": 1.776,
+      "hits": [],
+      "decode_mean_s": 0.1875,
+      "decode_std_s": 0.0005,
+      "rtf_mean": 0.1056
+    },
+    {
+      "file": "samples/neg_silence_3s_16k.wav",
+      "dur_s": 3.0,
+      "hits": [],
+      "decode_mean_s": 0.3031,
+      "decode_std_s": 0.0004,
+      "rtf_mean": 0.101
+    },
+    {
+      "file": "samples/neg_noise_3s_16k.wav",
+      "dur_s": 3.0,
+      "hits": [],
+      "decode_mean_s": 0.3029,
+      "decode_std_s": 0.0003,
+      "rtf_mean": 0.101
+    },
+    {
+      "file": "test_wavs/zh_5.wav",
+      "dur_s": 4.153,
+      "hits": [],
+      "decode_mean_s": 0.4008,
+      "decode_std_s": 0.0005,
+      "rtf_mean": 0.0965
+    }
+  ],
+  "asr": [
+    {
+      "file": "samples/cmd_open_light_16k.wav",
+      "dur_s": 1.776,
+      "text": "帮我打开灯",
+      "decode_mean_s": 0.1377,
+      "decode_std_s": 0.0002,
+      "rtf_mean": 0.0775
+    },
+    {
+      "file": "samples/cmd_weather_16k.wav",
+      "dur_s": 2.064,
+      "text": "今天天气怎么样",
+      "decode_mean_s": 0.1388,
+      "decode_std_s": 0.0003,
+      "rtf_mean": 0.0673
+    },
+    {
+      "file": "samples/cmd_time_16k.wav",
+      "dur_s": 1.848,
+      "text": "现在几点了",
+      "decode_mean_s": 0.138,
+      "decode_std_s": 0.0002,
+      "rtf_mean": 0.0747
+    },
+    {
+      "file": "samples/cmd_volume_16k.wav",
+      "dur_s": 2.208,
+      "text": "把音量调大一点",
+      "decode_mean_s": 0.1826,
+      "decode_std_s": 0.0003,
+      "rtf_mean": 0.0827
+    },
+    {
+      "file": "samples/cmd_mixed_16k.wav",
+      "dur_s": 3.456,
+      "text": "请帮我查询一下明天的会议安排",
+      "decode_mean_s": 0.2314,
+      "decode_std_s": 0.0011,
+      "rtf_mean": 0.067
+    },
+    {
+      "file": "samples/full_nihao_cmd_16k.wav",
+      "dur_s": 3.264,
+      "text": "你好小瑞帮我打开灯",
+      "decode_mean_s": 0.2308,
+      "decode_std_s": 0.0008,
+      "rtf_mean": 0.0707
+    },
+    {
+      "file": "samples/full_xiaorui_weather_16k.wav",
+      "dur_s": 3.144,
+      "text": "小瑞小瑞今天天气怎么样",
+      "decode_mean_s": 0.2318,
+      "decode_std_s": 0.0011,
+      "rtf_mean": 0.0737
+    },
+    {
+      "file": "test_wavs/0.wav",
+      "dur_s": 5.612,
+      "text": "对我做了介绍那么我想说的是呢大家如果对我的研究感兴趣呢",
+      "decode_mean_s": 0.4154,
+      "decode_std_s": 0.0012,
+      "rtf_mean": 0.074
+    },
+    {
+      "file": "test_wavs/1.wav",
+      "dur_s": 5.153,
+      "text": "重点呢想谈三个问题首先呢就是这一轮全球金融动荡的表现",
+      "decode_mean_s": 0.3718,
+      "decode_std_s": 0.001,
+      "rtf_mean": 0.0722
+    }
+  ],
+  "asr_threads": [
+    {
+      "threads": 1,
+      "dur_s": 5.612,
+      "decode_mean_s": 0.4926,
+      "rtf_mean": 0.0878
+    },
+    {
+      "threads": 2,
+      "dur_s": 5.612,
+      "decode_mean_s": 0.4223,
+      "rtf_mean": 0.0753
+    },
+    {
+      "threads": 4,
+      "dur_s": 5.612,
+      "decode_mean_s": 0.4409,
+      "rtf_mean": 0.0786
+    }
+  ],
+  "asr_affinity": [
+    {
+      "threads": 2,
+      "mean": 0.4113521696010139,
+      "std": 0.0028308887090193586,
+      "dur": 5.6115,
+      "rtf": 0.07330520709275842,
+      "label": "all_cpus",
+      "mask": null
+    },
+    {
+      "threads": 2,
+      "mean": 1.1704752248013393,
+      "std": 0.001196618614822468,
+      "dur": 5.6115,
+      "rtf": 0.20858508862181932,
+      "label": "A55_0-5",
+      "mask": "0-5"
+    },
+    {
+      "threads": 2,
+      "mean": 0.40790147380321284,
+      "std": 0.00044950647505181236,
+      "dur": 5.6115,
+      "rtf": 0.07269027422315118,
+      "label": "A76_6-7",
+      "mask": "6-7"
+    },
+    {
+      "threads": 1,
+      "mean": 0.49022954479733016,
+      "std": 0.0006144268853739692,
+      "dur": 5.6115,
+      "rtf": 0.08736158688360156,
+      "label": "A76_6-7_t1",
+      "mask": "6-7"
+    },
+    {
+      "threads": 1,
+      "mean": 1.5255285902007016,
+      "std": 0.0011777817797827955,
+      "dur": 5.6115,
+      "rtf": 0.2718575408002676,
+      "label": "A55_0-5_t1",
+      "mask": "0-5"
+    }
+  ],
+  "binary_cold": {
+    "wall_s": 3.114,
+    "reported_load_s": 2.55747,
+    "reported_elapsed_s": 0.45,
+    "reported_rtf": 0.08
+  },
+  "models_size": {
+    "models/kws/encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx": 4.388,
+    "models/kws/decoder-epoch-13-avg-2-chunk-8-left-64.onnx": 0.725,
+    "models/kws/joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx": 0.083,
+    "models/asr_zipformer_small_ctc_zh/model.int8.onnx": 25.122,
+    "models/vad/silero_vad.onnx": 0.614,
+    "models/vad/silero_vad.int8.onnx": 0.203
+  }
+}

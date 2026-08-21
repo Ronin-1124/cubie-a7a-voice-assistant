@@ -1,0 +1,9 @@
+This project includes or depends on:
+
+- sherpa-onnx (Apache-2.0), https://github.com/k2-fsa/sherpa-onnx
+- Matcha-TTS baker (icefall). The Baker Chinese dataset used to train
+  matcha-icefall-zh-baker is for non-commercial use only:
+  https://en.data-baker.com/datasets/freeDatasets/
+- Allwinner / Vivante VIP9000 NBG models produced with Acuity for A733.
+
+ONNX models are downloaded separately; they keep their upstream licenses.

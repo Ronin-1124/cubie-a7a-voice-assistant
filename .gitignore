@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+tts_out/
+models/**/*.onnx
+models/**/*.tar.bz2
+models/**/*.int8.onnx
+bin/
+lib/
+*.log
+build/
+.venv/
