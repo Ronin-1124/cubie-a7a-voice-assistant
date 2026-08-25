@@ -62,4 +62,4 @@ export VIV_VX_ENABLE_GRAPH_TRANSFORM="-Dump[transform.rewrite.gather_to_stride_s
 
 1. 用 sherpa 同款 fbank dump 多条标定，再量化 encoder  
 2. C++ 接 keywords 匹配（不要 greedy ASR）  
-3. 接入 `run_assistant.sh --kws npu`
+3. 接入 `python3 assistant_fast.py`（NPU KWS）

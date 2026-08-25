@@ -6,7 +6,7 @@
 | 硬件 | Radxa Cubie A7A / 全志 **A733** |
 | 板端工程 | `~/npu_demos/voice_assistant`（仅程序与模型，不放文档） |
 | 主机工程 | `examples/voice_assistant_a7a/` |
-| 运行时 | **sherpa-onnx** v1.13.4，**CPU only** |
+| 运行时 | 现为 NPU Zipformer；下表为早期 CPU sherpa-onnx 对照数据 |
 | 性能数据日期 | 2026-08-11 |
 | 原始 JSON | `docs/data/ASR_PERF_REPORT_DATA.json` |
 
@@ -75,7 +75,7 @@
 | VAD（备用） | Silero VAD | ~0.2–0.6 MB |
 | 运行时 so | libonnxruntime + sherpa | **~37 MB** |
 
-唤醒词文件：`keywords_wake.txt`（主推「你好小瑞 / 小瑞小瑞」；单独「你好」阈值更严防误触）。
+唤醒词文件：`keywords_wake.txt`（「你好小瑞 / 小瑞小瑞 / 小瑞」。已去掉单独「你好」，避免短词误唤醒）。
 
 ### 5. 使用方法
 
@@ -83,8 +83,8 @@
 ssh a7a
 cd ~/npu_demos/voice_assistant
 
-./run_assistant.sh              # KWS + ASR 循环（默认快路径）
-./run_assistant.sh --once
+python3 assistant_fast.py
+python3 assistant_fast.py --once
 ./mic_level_test.sh             # 电平：看 AC peak
 ./run_kws_mic.sh                # 仅 KWS
 ./run_asr_mic.sh                # 仅 ASR
@@ -185,7 +185,7 @@ CLI 每次冷启动 ASR：加载约 **2.56 s** + 解码 0.45 s（5.6 s 音频）
 ```bash
 # 板端（无文档，仅程序）
 cd ~/npu_demos/voice_assistant
-./run_assistant.sh
+python3 assistant_fast.py
 python3 offline_test.py
 # 若有脚本：python3 voice_perf_bench.py
 ```

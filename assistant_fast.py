@@ -2,7 +2,6 @@
 """Fast voice assistant: load KWS+ASR once, stream mic, endpoint on silence.
 
 Fixes false-wake loops:
-  - short keyword 你好 uses high per-word threshold in keywords file
   - cooldown + mic drain after each session
   - ASR never ends early on empty/noise-only endpoint
 """
@@ -22,7 +21,6 @@ import wave
 from pathlib import Path
 
 import numpy as np
-import sherpa_onnx
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_RATE = 16000
@@ -30,6 +28,20 @@ SAMPLE_RATE = 16000
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def codec_card() -> int:
+    env = os.environ.get("ALSA_CARD")
+    if env:
+        return int(env)
+    try:
+        text = Path("/proc/asound/cards").read_text()
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        if "ac101" in line.lower():
+            return int(line.strip().split()[0])
+    return 0
 
 
 def setup_mic() -> None:
@@ -41,6 +53,44 @@ def setup_mic() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def play_wav_file(path: Path, card: int | None = None) -> None:
+    """Play TTS. Mono wav is duplicated to L+R so both earcups get signal."""
+    card = codec_card() if card is None else card
+    play_path = path
+    try:
+        with wave.open(str(path), "rb") as w:
+            nch, sw, sr, nfr = (
+                w.getnchannels(),
+                w.getsampwidth(),
+                w.getframerate(),
+                w.getnframes(),
+            )
+            data = w.readframes(nfr)
+        if nch == 1 and sw == 2:
+            mono = np.frombuffer(data, dtype=np.int16)
+            st = np.empty(mono.size * 2, dtype=np.int16)
+            st[0::2] = mono
+            st[1::2] = mono
+            play_path = path.with_name(path.stem + ".st.wav")
+            with wave.open(str(play_path), "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(st.tobytes())
+    except Exception:
+        play_path = path
+    subprocess.run(
+        ["amixer", "-c", str(card), "sset", "HPOUT", "on"],
+        capture_output=True,
+    )
+    pr = subprocess.run(
+        ["aplay", "-q", "-D", f"plughw:{card},0", str(play_path)],
+        capture_output=True,
+    )
+    if pr.returncode != 0:
+        subprocess.run(["aplay", "-q", str(play_path)], capture_output=True)
 
 
 class HighPass:
@@ -74,12 +124,15 @@ class HighPass:
 
 
 class AlsaMic:
-    """Continuous mono 16 kHz capture via arecord."""
+    """Capture AC101B stereo PCM, keep the live jack-mic slot, apply gain."""
 
     def __init__(self, device: str):
         self.device = device
         self.proc: subprocess.Popen | None = None
-        self.hp = HighPass()
+        self.hp_l = HighPass()
+        self.hp_r = HighPass()
+        self.gain = float(os.environ.get("MIC_GAIN", "4"))
+        self.card = codec_card()
         self.open()
 
     def open(self) -> None:
@@ -88,13 +141,13 @@ class AlsaMic:
             [
                 "arecord",
                 "-D",
-                self.device,
+                f"hw:{self.card},0",
                 "-f",
                 "S16_LE",
                 "-r",
                 str(SAMPLE_RATE),
                 "-c",
-                "1",
+                "2",
                 "-t",
                 "raw",
                 "-q",
@@ -119,19 +172,23 @@ class AlsaMic:
 
     def read(self, n_samples: int = 1600) -> np.ndarray:
         assert self.proc and self.proc.stdout
-        need = n_samples * 2
+        need = n_samples * 4
         buf = bytearray()
         while len(buf) < need:
             chunk = self.proc.stdout.read(need - len(buf))
             if not chunk:
-                log("mic EOF, reopening…")
                 time.sleep(0.2)
                 self.open()
                 assert self.proc and self.proc.stdout
                 continue
             buf.extend(chunk)
-        raw = np.frombuffer(bytes(buf), dtype=np.int16).astype(np.float32) / 32768.0
-        return self.hp.process(raw)
+        st = np.frombuffer(bytes(buf), dtype=np.int16).astype(np.float32) / 32768.0
+        left = self.hp_l.process(st[0::2])
+        right = self.hp_r.process(st[1::2])
+        el = float(np.sqrt(np.mean(left * left) + 1e-12))
+        er = float(np.sqrt(np.mean(right * right) + 1e-12))
+        x = right if er > el * 1.3 else left
+        return np.clip(x * self.gain, -1.0, 1.0)
 
     def drain(self, seconds: float, chunk: int) -> None:
         """Throw away audio (cooldown / clear residual)."""
@@ -439,51 +496,13 @@ def ac_rms(samples: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x * x)))
 
 
-def create_kws(
-    keywords: Path, num_threads: int, keywords_threshold: float
-) -> sherpa_onnx.KeywordSpotter:
-    kws_dir = ROOT / "models" / "kws"
-    return sherpa_onnx.KeywordSpotter(
-        tokens=str(kws_dir / "tokens.txt"),
-        encoder=str(kws_dir / "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx"),
-        decoder=str(kws_dir / "decoder-epoch-13-avg-2-chunk-8-left-64.onnx"),
-        joiner=str(kws_dir / "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx"),
-        keywords_file=str(keywords),
-        num_threads=num_threads,
-        sample_rate=SAMPLE_RATE,
-        keywords_score=1.0,
-        keywords_threshold=keywords_threshold,
-        provider="cpu",
-    )
-
-
-def create_asr(num_threads: int, silence: float) -> sherpa_onnx.OnlineRecognizer:
-    asr_dir = ROOT / "models" / "asr_zipformer_small_ctc_zh"
-    return sherpa_onnx.OnlineRecognizer.from_zipformer2_ctc(
-        tokens=str(asr_dir / "tokens.txt"),
-        model=str(asr_dir / "model.int8.onnx"),
-        num_threads=num_threads,
-        sample_rate=SAMPLE_RATE,
-        enable_endpoint_detection=True,
-        # rule1: pure silence without decoded text — wait longer, avoid early empty end
-        rule1_min_trailing_silence=3.5,
-        # rule2: after some non-silence decoded, shorter silence ends utterance
-        rule2_min_trailing_silence=silence,
-        rule3_min_utterance_length=15.0,
-        decoding_method="greedy_search",
-        provider="cpu",
-    )
-
-
 def wait_wake(
-    kws: sherpa_onnx.KeywordSpotter | None,
-    npu_kws: NpuKws | None,
+    npu_kws: NpuKws,
     mic: AlsaMic,
     chunk: int,
     min_energy: float,
 ) -> str:
     """Block until keyword; ignore low-energy chunks (noise / DC)."""
-    stream = kws.create_stream() if kws is not None else None
     log("listening…")
     idle = 0
     while True:
@@ -496,105 +515,15 @@ def wait_wake(
         else:
             idle = 0
         e = ac_rms(samples)
-        if npu_kws is not None:
-            hit = npu_kws.poll_hit()
-            if hit:
-                return hit
-            if e < min_energy:
-                continue
-            npu_kws.feed(samples)
-            hit = npu_kws.poll_hit()
-            if hit:
-                return hit
-            continue
-        # Do not feed near-silent frames into KWS (reduces false 你好)
+        hit = npu_kws.poll_hit()
+        if hit:
+            return hit
         if e < min_energy:
             continue
-        assert kws is not None and stream is not None
-        stream.accept_waveform(SAMPLE_RATE, samples)
-        while kws.is_ready(stream):
-            kws.decode_stream(stream)
-            r = kws.get_result(stream)
-            if r:
-                kw = r if isinstance(r, str) else str(r)
-                kws.reset_stream(stream)
-                return kw
-
-
-def write_wav16(path: Path, samples: np.ndarray) -> None:
-    pcm = np.clip(samples, -1.0, 1.0)
-    pcm = (pcm * 32767.0).astype(np.int16)
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm.tobytes())
-
-
-def record_utterance(
-    mic: AlsaMic,
-    chunk: int,
-    max_seconds: float,
-    skip_ms: int,
-    min_energy: float,
-    silence: float,
-) -> np.ndarray:
-    """Record one command: skip after wake, wait for speech, stop on trailing silence."""
-    skip_samples = int(SAMPLE_RATE * skip_ms / 1000)
-    skipped = 0
-    while skipped < skip_samples:
-        n = min(chunk, skip_samples - skipped)
-        mic.read(n)
-        skipped += n
-
-    log("speak…")
-    t0 = time.time()
-    buf: list[np.ndarray] = []
-    voiced = False
-    silent_run = 0.0
-    chunk_s = chunk / SAMPLE_RATE
-
-    while time.time() - t0 < max_seconds:
-        samples = mic.read(chunk)
-        buf.append(samples)
-        e = ac_rms(samples)
-        if e >= min_energy:
-            voiced = True
-            silent_run = 0.0
-        elif voiced:
-            silent_run += chunk_s
-            if silent_run >= silence:
-                break
-
-    if not buf:
-        return np.zeros(0, dtype=np.float32)
-    return np.concatenate(buf)
-
-
-def npu_asr_file(wav: Path, npu_dir: Path) -> tuple[str, str]:
-    """Run zoo zipformer NBG demo. Returns (text, rtf_line)."""
-    script = ROOT / "run_npu_asr.sh"
-    env = os.environ.copy()
-    env["NPU_ASR_DIR"] = str(npu_dir)
-    r = subprocess.run(
-        ["bash", str(script), str(wav)],
-        cwd=str(ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    out = (r.stdout or "") + "\n" + (r.stderr or "")
-    if r.returncode != 0:
-        log(f"NPU ASR failed:\n{out[-800:]}")
-        return "", ""
-    text = ""
-    rtf = ""
-    for line in out.splitlines():
-        if line.startswith("TEXT="):
-            text = line[5:].strip()
-        elif "Real Time Factor" in line:
-            rtf = line.strip()
-    return text, rtf
+        npu_kws.feed(samples)
+        hit = npu_kws.poll_hit()
+        if hit:
+            return hit
 
 
 def recognize_command_npu(
@@ -614,7 +543,7 @@ def recognize_command_npu(
         mic.read(n)
         skipped += n
 
-    log("speak…")
+
     t0 = time.time()
     voiced = False
     silent_run = 0.0
@@ -639,104 +568,17 @@ def recognize_command_npu(
     return npu_asr.end_utt().strip()
 
 
-def recognize_command(
-    asr: sherpa_onnx.OnlineRecognizer,
-    mic: AlsaMic,
-    chunk: int,
-    max_seconds: float,
-    skip_ms: int,
-    min_energy: float,
-) -> str:
-    """Stream ASR until non-empty endpoint or max_seconds.
-
-    Never return early on empty endpoint (noise used to look like 'speech').
-    """
-    stream = asr.create_stream()
-    skip_samples = int(SAMPLE_RATE * skip_ms / 1000)
-    skipped = 0
-    while skipped < skip_samples:
-        n = min(chunk, skip_samples - skipped)
-        mic.read(n)
-        skipped += n
-
-    log("speak…")
-    t0 = time.time()
-    last_text = ""
-    last_partial_print = ""
-    saw_text = False
-
-    while time.time() - t0 < max_seconds:
-        samples = mic.read(chunk)
-        stream.accept_waveform(SAMPLE_RATE, samples)
-        while asr.is_ready(stream):
-            asr.decode_stream(stream)
-
-        text = asr.get_result(stream)
-        if text and text != last_partial_print:
-            last_partial_print = text
-            last_text = text
-            saw_text = True
-
-        if asr.is_endpoint(stream):
-            pad = np.zeros(int(0.4 * SAMPLE_RATE), dtype=np.float32)
-            stream.accept_waveform(SAMPLE_RATE, pad)
-            stream.input_finished()
-            while asr.is_ready(stream):
-                asr.decode_stream(stream)
-            text = (asr.get_result(stream) or last_text).strip()
-            asr.reset(stream)
-            if text:
-                return text
-            stream = asr.create_stream()
-            last_text = ""
-            last_partial_print = ""
-            saw_text = False
-
-    # timeout flush
-    pad = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-    stream.accept_waveform(SAMPLE_RATE, pad)
-    stream.input_finished()
-    while asr.is_ready(stream):
-        asr.decode_stream(stream)
-    text = (asr.get_result(stream) or last_text).strip()
-    asr.reset(stream)
-    return text
-
-
-def _fs2_example_dir() -> Path:
-    """Host zoo example, or models copied next to the assistant on the board."""
-    cands = [
-        ROOT / "tts_fs2",
-        ROOT.parent / "tts_fs2_hifigan_zh",
-        ROOT / "models" / "tts" / "fs2_hifigan_csmsc",
-    ]
-    for p in cands:
-        if (p / "tools" / "tts_infer.py").is_file() or (p / "tts_infer.py").is_file():
-            return p
-        if (p / "fastspeech2_csmsc.onnx").is_file():
-            return p
-    return ROOT.parent / "tts_fs2_hifigan_zh"
-
-
-def speak_fs2npu(text: str, out: Path, play: bool = True) -> str | None:
-    """CPU FastSpeech2-CSMSC + HiFi-GAN (ORT on host, NBG on board)."""
-    ex = _fs2_example_dir()
-    script = ex / "tools" / "tts_infer.py"
-    if not script.is_file():
-        script = ex / "tts_infer.py"
-    if not script.is_file():
-        log(f"fs2npu script missing under {ex}")
+def speak_tts(text: str, play: bool = True) -> str | None:
+    """Matcha-baker CPU acoustic + HiFi-GAN v2 NPU vocoder."""
+    if not text.strip():
         return None
-    model_dir = ex / "model" if (ex / "model").is_dir() else ex
-    acoustic = model_dir / "fastspeech2_csmsc.onnx"
-    if not acoustic.is_file():
-        acoustic = ROOT / "models" / "tts" / "fs2_hifigan_csmsc" / "fastspeech2_csmsc.onnx"
-    phones = ex / "frontend" / "phone_id_map.txt"
-    if not phones.is_file():
-        phones = ROOT / "models" / "tts" / "fs2_hifigan_csmsc" / "phone_id_map.txt"
-    nb = model_dir / "hifigan_uint8_a733.nb"
-    if not nb.is_file():
-        nb = ROOT / "models" / "tts" / "fs2_hifigan_csmsc" / "hifigan_uint8_a733.nb"
+    script = ROOT / "tools" / "matcha_npu.py"
+    if not script.is_file():
+        log(f"matcha_npu.py missing under {ROOT / 'tools'}")
+        return None
+    out_dir = ROOT / "tts_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"reply_{int(time.time())}.wav"
     cmd = [
         sys.executable,
         str(script),
@@ -744,183 +586,31 @@ def speak_fs2npu(text: str, out: Path, play: bool = True) -> str | None:
         text,
         "-o",
         str(out),
-        "--acoustic",
-        str(acoustic),
-        "--phones",
-        str(phones),
-        "--nb",
-        str(nb),
         "--vocoder",
-        "auto",
-        "--work",
-        str(ROOT / "tts_out" / "fs2_work"),
+        "npu",
     ]
-    if play:
-        cmd.append("--play")
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=str(ex if (ex / "tools").is_dir() else ROOT), capture_output=True, text=True)
-    dt = time.time() - t0
-    if r.returncode != 0 or not out.is_file():
-        log(f"TTS fail ({dt:.1f}s)")
-        return None
-    log(f"TTS {dt:.1f}s")
-    return str(out)
-
-
-def speak_tts(
-    text: str,
-    engine: str = "vits",
-    sid: int = 10,
-    threads: int = 2,
-    play: bool = True,
-) -> str | None:
-    """Synthesize with sherpa-onnx-offline-tts or FS2+NPU vocoder. Returns wav path."""
-    if not text.strip():
-        return None
-    bin_tts = ROOT / "bin" / "sherpa-onnx-offline-tts"
-    if not bin_tts.is_file():
-        log("TTS binary missing; skip speak")
-        return None
-    out_dir = ROOT / "tts_out"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"reply_{int(time.time())}.wav"
-    cmd: list[str]
-    if engine in ("vits", "aishell3"):
-        v = ROOT / "models" / "tts" / "vits-icefall-zh-aishell3"
-        if not (v / "model.onnx").is_file():
-            log(f"VITS model missing under {v}")
-            return None
-        cmd = [
-            str(bin_tts),
-            f"--vits-model={v / 'model.onnx'}",
-            f"--vits-lexicon={v / 'lexicon.txt'}",
-            f"--vits-tokens={v / 'tokens.txt'}",
-            f"--tts-rule-fsts={v / 'phone.fst'},{v / 'date.fst'},{v / 'number.fst'}",
-            f"--num-threads={threads}",
-            f"--sid={sid}",
-            f"--output-filename={out}",
-            text,
-        ]
-    elif engine == "kokoro":
-        k = ROOT / "models" / "tts" / "kokoro-int8-multi-lang-v1_1"
-        if not (k / "model.int8.onnx").is_file():
-            log(f"Kokoro model missing under {k}")
-            return None
-        cmd = [
-            str(bin_tts),
-            f"--kokoro-model={k / 'model.int8.onnx'}",
-            f"--kokoro-voices={k / 'voices.bin'}",
-            f"--kokoro-tokens={k / 'tokens.txt'}",
-            f"--kokoro-data-dir={k / 'espeak-ng-data'}",
-            f"--kokoro-lexicon={k / 'lexicon-us-en.txt'},{k / 'lexicon-zh.txt'}",
-            f"--tts-rule-fsts={k / 'phone-zh.fst'},{k / 'date-zh.fst'},{k / 'number-zh.fst'}",
-            f"--num-threads={threads}",
-            f"--sid={sid}",
-            f"--output-filename={out}",
-            text,
-        ]
-    elif engine == "melo":
-        m = ROOT / "models" / "tts" / "vits-melo-tts-zh_en"
-        if not (m / "model.onnx").is_file():
-            log(f"Melo model missing under {m}")
-            return None
-        cmd = [
-            str(bin_tts),
-            f"--vits-model={m / 'model.onnx'}",
-            f"--vits-lexicon={m / 'lexicon.txt'}",
-            f"--vits-tokens={m / 'tokens.txt'}",
-            f"--tts-rule-fsts={m / 'phone.fst'},{m / 'date.fst'},{m / 'number.fst'}",
-            f"--num-threads={threads}",
-            "--sid=0",
-            f"--output-filename={out}",
-            text,
-        ]
-    elif engine in ("matcha", "matchahifi"):
-        a = ROOT / "models" / "tts" / "matcha-icefall-zh-baker"
-        voc_name = "hifigan_v2.onnx" if engine == "matchahifi" else "vocos-22khz-univ.onnx"
-        v = ROOT / "models" / "tts" / voc_name
-        if not (a / "model-steps-3.onnx").is_file() or not v.is_file():
-            log(f"Matcha/vocoder missing: {a} {v}")
-            return None
-        cmd = [
-            str(bin_tts),
-            f"--matcha-acoustic-model={a / 'model-steps-3.onnx'}",
-            f"--matcha-vocoder={v}",
-            f"--matcha-lexicon={a / 'lexicon.txt'}",
-            f"--matcha-tokens={a / 'tokens.txt'}",
-            f"--tts-rule-fsts={a / 'phone.fst'},{a / 'date.fst'},{a / 'number.fst'}",
-            f"--num-threads={threads}",
-            f"--output-filename={out}",
-            text,
-        ]
-    elif engine == "matchanpu":
-        script = ROOT / "tools" / "matcha_npu.py"
-        if not script.is_file():
-            log(f"matcha_npu.py missing under {ROOT / 'tools'}")
-            return None
-        cmd = [
-            sys.executable,
-            str(script),
-            "--text",
-            text,
-            "-o",
-            str(out),
-            "--vocoder",
-            "npu",
-        ]
-        if play:
-            cmd.append("--play")
-        t0 = time.time()
-        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
-        dt = time.time() - t0
-        if r.returncode != 0 or not out.is_file():
-            log(f"TTS fail ({dt:.1f}s)")
-            return None
-        log(f"TTS {dt:.1f}s")
-        return str(out)
-    elif engine in ("fs2npu", "fs2"):
-        return speak_fs2npu(text, out, play=play)
-    else:
-        log(f"unknown TTS engine: {engine}")
-        return None
-
-    env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = f"{ROOT / 'lib'}:{env.get('LD_LIBRARY_PATH', '')}"
-    t0 = time.time()
-    r = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
     dt = time.time() - t0
     if r.returncode != 0 or not out.is_file():
         log(f"TTS fail ({dt:.1f}s)")
         return None
     log(f"TTS {dt:.1f}s")
     if play:
-        subprocess.run(
-            ["amixer", "-c", "1", "cset", "name=HPOUT Switch", "on"],
-            capture_output=True,
-        )
-        pr = subprocess.run(
-            ["aplay", "-D", "plughw:1,0", str(out)],
-            capture_output=True,
-            text=True,
-        )
-        if pr.returncode != 0:
-            subprocess.run(["aplay", str(out)], capture_output=True)
+        play_wav_file(out)
     return str(out)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Fast A7A KWS+ASR (models preloaded)")
-    ap.add_argument("--device", default="kws_mic")
+    ap = argparse.ArgumentParser(description="A7A NPU voice assistant (KWS+ASR+TTS)")
     ap.add_argument(
         "--from-wav",
         nargs="+",
         default=None,
         metavar="WAV",
-        help="desk test: feed wav(s) instead of mic (no need to speak). implies --once",
+        help="desk test: feed wav(s) instead of mic. implies --once",
     )
     ap.add_argument("--keywords", default=str(ROOT / "keywords_wake.txt"))
-    ap.add_argument("--kws-threads", type=int, default=1)
-    ap.add_argument("--asr-threads", type=int, default=2)
     ap.add_argument("--chunk-ms", type=int, default=100)
     ap.add_argument("--silence", type=float, default=0.8)
     ap.add_argument("--max-cmd-seconds", type=float, default=8.0)
@@ -929,19 +619,13 @@ def main() -> int:
         "--cooldown",
         type=float,
         default=1.5,
-        help="seconds to ignore mic after a session (anti false-wake loop)",
+        help="seconds to ignore mic after a session",
     )
     ap.add_argument(
         "--min-energy",
         type=float,
         default=0.0,
-        help="AC RMS gate after 50Hz HPF; 0 = feed every frame (live mic is very quiet)",
-    )
-    ap.add_argument(
-        "--keywords-threshold",
-        type=float,
-        default=0.12,
-        help="global KWS threshold (per-word # in file can override)",
+        help="AC RMS gate after HPF; 0 = feed every frame",
     )
     ap.add_argument(
         "--tts",
@@ -957,62 +641,38 @@ def main() -> int:
         help="disable TTS playback",
     )
     ap.add_argument(
-        "--tts-engine",
-        default="matchanpu",
-        choices=("vits", "kokoro", "melo", "matcha", "matchahifi", "matchanpu", "fs2npu"),
-        help="default matchanpu=Matcha CPU + HiFi-GAN NPU; vits=8kHz CPU",
-    )
-    ap.add_argument("--tts-sid", type=int, default=10, help="speaker id")
-    ap.add_argument("--tts-threads", type=int, default=2)
-    ap.add_argument(
         "--tts-template",
         default="好的，你说的是：{text}",
         help="reply template; {text} = ASR result",
     )
     ap.add_argument(
-        "--kws",
-        default="npu",
-        choices=("cpu", "npu"),
-        help="npu=kws_npu_demo NBG (default); cpu=sherpa KeywordSpotter",
-    )
-    ap.add_argument(
         "--npu-kws-dir",
         default=str(Path.home() / "npu_demos" / "kws_npu_demo"),
-        help="directory of kws_npu_demo_a733 + float encoder/decoder/joiner NBG",
-    )
-    ap.add_argument(
-        "--asr",
-        default="npu",
-        choices=("cpu", "npu"),
-        help="npu=zoo Zipformer NBG (default); cpu=sherpa Zipformer-CTC",
+        help="kws_npu_demo_a733 + float encoder/decoder/joiner NBG",
     )
     ap.add_argument(
         "--npu-asr-dir",
         default=str(Path.home() / "npu_demos" / "zipformer_demo_linux_a733"),
-        help="directory of zipformer_demo_a733 + encoder/decoder/joiner NBG",
+        help="zipformer_demo_a733 + encoder/decoder/joiner NBG",
     )
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
 
     keywords = Path(args.keywords)
     if not keywords.is_file():
-        keywords = ROOT / "keywords.txt"
-    if not keywords.is_file():
         log(f"missing keywords: {keywords}")
         return 1
 
     npu_dir = Path(args.npu_asr_dir)
     npu_kws_dir = Path(args.npu_kws_dir)
-    if args.asr == "npu":
-        demo = npu_dir / "zipformer_demo_a733"
-        if not demo.is_file():
-            log(f"missing NPU demo: {demo}")
-            return 1
-    if args.kws == "npu":
-        kws_bin = npu_kws_dir / "kws_npu_demo_a733"
-        if not kws_bin.is_file():
-            log(f"missing NPU KWS demo: {kws_bin}")
-            return 1
+    demo = npu_dir / "zipformer_demo_a733"
+    kws_bin = npu_kws_dir / "kws_npu_demo_a733"
+    if not demo.is_file():
+        log(f"missing NPU ASR demo: {demo}")
+        return 1
+    if not kws_bin.is_file():
+        log(f"missing NPU KWS demo: {kws_bin}")
+        return 1
 
     wav_paths: list[Path] = []
     if args.from_wav:
@@ -1034,120 +694,73 @@ def main() -> int:
     chunk = int(SAMPLE_RATE * args.chunk_ms / 1000)
 
     t0 = time.time()
-    kws = None
-    npu_kws = None
-    npu_asr = None
-    if args.kws == "npu":
-        npu_kws = NpuKws(npu_kws_dir, keywords)
-    else:
-        kws = create_kws(keywords, args.kws_threads, args.keywords_threshold)
-    asr = None
-    if args.asr == "cpu":
-        asr = create_asr(args.asr_threads, args.silence)
-    else:
-        if npu_kws is None:
-            npu_asr = NpuAsr(npu_dir)
+    npu_kws = NpuKws(npu_kws_dir, keywords)
+    npu_asr: NpuAsr | None = None
 
     if wav_paths:
         mic = WavMic(wav_paths)
     else:
-        mic = AlsaMic(args.device)
-        # startup settle: drop first 0.5s
+        mic = AlsaMic("hw:0,0")
         mic.drain(0.5, chunk)
 
-    tts_bit = args.tts_engine if args.tts else "off"
-    log(
-        f"kws={args.kws} asr={args.asr} tts={tts_bit}  "
-        f"ready {time.time()-t0:.1f}s"
-    )
+    log(f"kws=npu asr=npu tts={'npu' if args.tts else 'off'}  ready {time.time()-t0:.1f}s")
 
     try:
         while True:
-            if npu_kws is not None and not npu_kws.alive():
+            if not npu_kws.alive():
                 log("NPU KWS died, restarting…")
                 npu_kws.start()
-            kw = wait_wake(kws, npu_kws, mic, chunk, args.min_energy)
+            kw = wait_wake(npu_kws, mic, chunk, args.min_energy)
             if not kw:
                 log("no wake, exit")
                 break
             log(f"WAKE {kw}")
 
             t_asr0 = time.time()
-            # VIP is exclusive: drop KWS NBG before NPU ASR, reload after.
-            if args.asr == "npu" and npu_kws is not None:
-                npu_kws.stop()
-                if npu_asr is None or not npu_asr.alive():
-                    npu_asr = NpuAsr(npu_dir)
-            if args.asr == "npu":
-                assert npu_asr is not None
-                text = recognize_command_npu(
-                    mic,
-                    chunk,
-                    args.max_cmd_seconds,
-                    args.skip_ms,
-                    args.min_energy,
-                    args.silence,
-                    npu_asr,
-                )
-            else:
-                text = recognize_command(
-                    asr,
-                    mic,
-                    chunk,
-                    args.max_cmd_seconds,
-                    args.skip_ms,
-                    args.min_energy,
-                )
+            npu_kws.stop()
+            if npu_asr is None or not npu_asr.alive():
+                npu_asr = NpuAsr(npu_dir)
+            text = recognize_command_npu(
+                mic,
+                chunk,
+                args.max_cmd_seconds,
+                args.skip_ms,
+                args.min_energy,
+                args.silence,
+                npu_asr,
+            )
             t_asr1 = time.time()
-
             log(f"TEXT {text if text else '(empty)'}  {t_asr1 - t_asr0:.1f}s")
 
             if args.tts and text:
-                # release mic while playing to avoid feedback into next KWS
                 mic.close()
-                # VIP is exclusive: Matcha NPU vocoder cannot share the NPU
-                # with KWS/ASR NBGs.
-                if args.tts_engine == "matchanpu":
-                    if npu_kws is not None:
-                        npu_kws.stop()
-                    if npu_asr is not None:
-                        npu_asr.stop()
-                        npu_asr = None
+                npu_kws.stop()
+                if npu_asr is not None:
+                    npu_asr.stop()
+                    npu_asr = None
                 reply = args.tts_template.format(text=text, wake=kw)
-                speak_tts(
-                    reply,
-                    engine=args.tts_engine,
-                    sid=args.tts_sid,
-                    threads=args.tts_threads,
-                    play=True,
-                )
+                speak_tts(reply, play=True)
                 mic.open()
                 mic.drain(0.3, chunk)
 
             if args.once:
                 break
 
-            # Anti-loop: do not immediately re-enter KWS on residual / noise
             cool = args.cooldown
             if not text:
                 cool = max(cool, 2.0)
             if args.tts:
                 cool = max(cool, 1.0)
             mic.drain(cool, chunk)
-            need_kws_reload = npu_kws is not None and (
-                (args.asr == "npu") or (args.tts and args.tts_engine == "matchanpu")
-            )
-            if need_kws_reload:
-                if npu_asr is not None:
-                    npu_asr.stop()
-                    npu_asr = None
-                if not npu_kws.alive():
-                    npu_kws.start()
+            if npu_asr is not None:
+                npu_asr.stop()
+                npu_asr = None
+            if not npu_kws.alive():
+                npu_kws.start()
     except KeyboardInterrupt:
         log("bye")
     finally:
-        if npu_kws is not None:
-            npu_kws.stop()
+        npu_kws.stop()
         if npu_asr is not None:
             npu_asr.stop()
         mic.close()

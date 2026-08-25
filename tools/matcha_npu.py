@@ -292,17 +292,20 @@ def run_vocoder_npu(mel: np.ndarray, demo: Path, nb: Path, work: Path) -> tuple[
     return load_float_bin(out_bin), dt, log
 
 
-def run_vocoder_ort(mel: np.ndarray, onnx_path: Path) -> tuple[np.ndarray, float]:
-    import onnxruntime as ort
+def _codec_card() -> int:
+    try:
+        text = Path("/proc/asound/cards").read_text()
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        if "ac101" in line.lower():
+            return int(line.strip().split()[0])
+    return 0
 
-    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    name = sess.get_inputs()[0].name
-    t0 = time.time()
-    wav = sess.run(None, {name: mel.astype(np.float32)})[0]
-    return np.asarray(wav, dtype=np.float32).reshape(-1), time.time() - t0
 
+def setup_board_audio(card: int | None = None) -> None:
+    card = _codec_card() if card is None else card
 
-def setup_board_audio(card: int = 1) -> None:
     def _run(cmd):
         try:
             subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -310,19 +313,40 @@ def setup_board_audio(card: int = 1) -> None:
             pass
 
     _run(["amixer", "-c", str(card), "sset", "HPOUT", "on"])
-    _run(["amixer", "-c", str(card), "sset", "DAC Gain", "4"])
-    _run(["amixer", "-c", str(card), "sset", "HPOUT Gain", "5"])
 
 
 def play_wav(path: Path) -> None:
+    card = _codec_card()
+    setup_board_audio(card)
+    play_path = path
+    try:
+        import wave as _wave
+
+        import numpy as np
+
+        with _wave.open(str(path), "rb") as w:
+            nch, sw, sr, nfr = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+            data = w.readframes(nfr)
+        if nch == 1 and sw == 2:
+            mono = np.frombuffer(data, dtype=np.int16)
+            st = np.empty(mono.size * 2, dtype=np.int16)
+            st[0::2] = mono
+            st[1::2] = mono
+            play_path = path.with_name(path.stem + ".st.wav")
+            with _wave.open(str(play_path), "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(st.tobytes())
+    except Exception:
+        play_path = path
     for cmd in (
-        ["aplay", "-q", "-D", "plughw:1,0", str(path)],
-        ["aplay", "-q", str(path)],
+        ["aplay", "-q", "-D", f"plughw:{card},0", str(play_path)],
+        ["aplay", "-q", str(play_path)],
     ):
         try:
             r = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if r.returncode == 0:
-                print("[audio]", " ".join(cmd[:-1]))
                 return
         except FileNotFoundError:
             continue
@@ -336,10 +360,9 @@ def main() -> int:
     ap.add_argument("--acoustic", default=str(TTS / "matcha-icefall-zh-baker" / "model-steps-3.onnx"))
     ap.add_argument("--lexicon", default=str(TTS / "matcha-icefall-zh-baker" / "lexicon.txt"))
     ap.add_argument("--tokens", default=str(TTS / "matcha-icefall-zh-baker" / "tokens.txt"))
-    ap.add_argument("--hifigan", default=str(TTS / "hifigan_v2.onnx"))
     ap.add_argument("--nb", default="")
     ap.add_argument("--npu-bin", default="")
-    ap.add_argument("--vocoder", choices=["npu", "cpu", "both"], default="npu")
+    ap.add_argument("--vocoder", choices=["npu"], default="npu")
     ap.add_argument("--play", action="store_true")
     ap.add_argument("--work", default=str(ROOT / "tts_out" / "matcha_npu_work"))
     ap.add_argument("--speed", type=float, default=1.0)
@@ -353,7 +376,6 @@ def main() -> int:
     for i, ids in enumerate(sentences):
         print(f"[g2p] sent{i} tokens={ids.size} ids={ids.tolist()}")
 
-    voc = args.vocoder
     demo, nb = find_npu()
     if args.npu_bin:
         demo = Path(args.npu_bin)
@@ -361,12 +383,13 @@ def main() -> int:
         nb = Path(args.nb)
 
     wav_npu_parts: list[np.ndarray] = []
-    wav_cpu_parts: list[np.ndarray] = []
-    dt_a = dt_npu = dt_cpu = 0.0
+    dt_a = dt_npu = 0.0
     last_log = ""
     t_total = 0
 
-    hifi = Path(args.hifigan)
+    if not demo or not nb or not demo.is_file() or not nb.is_file():
+        raise SystemExit(f"NPU vocoder missing: demo={demo} nb={nb}")
+
     for si, ids in enumerate(sentences):
         mel, dt = run_acoustic(ids, Path(args.acoustic), speed=args.speed)
         dt_a += dt
@@ -376,46 +399,26 @@ def main() -> int:
         t_total += t_frames
         print(f"[mel] sent{si} T={t_frames} nbg_chunks={len(chunks)}")
 
-        if voc in ("npu", "both"):
-            if not demo or not nb or not demo.is_file() or not nb.is_file():
-                raise SystemExit(f"NPU vocoder missing: demo={demo} nb={nb}")
-            kept = 0
-            for ci, ch in enumerate(chunks):
-                w, dt, log = run_vocoder_npu(ch, demo, nb, Path(args.work) / f"s{si}c{ci}")
-                dt_npu += dt
-                last_log = log
-                take = min(len(w), min(MEL_FRAMES, t_frames - kept) * HOP)
-                wav_npu_parts.append(w[:take])
-                kept += MEL_FRAMES
-            print(f"[vocoder npu] sent{si} {dt_npu*1000:.1f} ms cum  nb={nb.name}")
+        kept = 0
+        for ci, ch in enumerate(chunks):
+            w, dt, log = run_vocoder_npu(ch, demo, nb, Path(args.work) / f"s{si}c{ci}")
+            dt_npu += dt
+            last_log = log
+            take = min(len(w), min(MEL_FRAMES, t_frames - kept) * HOP)
+            wav_npu_parts.append(w[:take])
+            kept += MEL_FRAMES
+        print(f"[vocoder npu] sent{si} {dt_npu*1000:.1f} ms cum  nb={nb.name}")
 
-        if voc in ("cpu", "both"):
-            if not hifi.is_file():
-                raise SystemExit(f"missing {hifi}")
-            w, dt = run_vocoder_ort(mel, hifi)
-            dt_cpu += dt
-            wav_cpu_parts.append(w)
-            print(f"[vocoder cpu] sent{si} {dt*1000:.1f} ms")
-
-    wav_npu = np.concatenate(wav_npu_parts) if wav_npu_parts else None
-    wav_cpu = np.concatenate(wav_cpu_parts) if wav_cpu_parts else None
+    wav = np.concatenate(wav_npu_parts) if wav_npu_parts else None
     if last_log:
         print(last_log)
     print(f"[mel] total T={t_total}")
 
     out = Path(args.output) if args.output else Path(args.work) / f"matchanpu_{int(time.time())}.wav"
-    wav = wav_npu if wav_npu is not None else wav_cpu
     write_wav(out, wav)
     dur = len(wav) / SR
-    rtf = (dt_a + (dt_npu if wav_npu is not None else dt_cpu)) / max(dur, 1e-6)
+    rtf = (dt_a + dt_npu) / max(dur, 1e-6)
     print(f"[tts] {dur:.2f}s @{SR} RTF={rtf:.3f} peak={float(np.max(np.abs(wav))):.3f} -> {out}")
-
-    if voc == "both" and wav_cpu is not None:
-        cpu_out = out.with_name(out.stem.replace("npu", "cpu") + "_cpu.wav")
-        if cpu_out == out:
-            cpu_out = out.with_name(out.stem + "_cpu.wav")
-        write_wav(cpu_out, wav_cpu)
-        print(f"[tts] cpu pair -> {cpu_out}")
 
     if args.play:
         setup_board_audio()

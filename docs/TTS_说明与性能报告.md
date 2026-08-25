@@ -6,7 +6,7 @@
 | 硬件 | Radxa Cubie A7A / 全志 **A733** |
 | 板端 | `~/npu_demos/voice_assistant`（仅程序与模型，**不放文档**） |
 | 主机工程 | `examples/voice_assistant_a7a/` |
-| 运行时 | sherpa-onnx + Matcha 声学 CPU；声码器可选 NPU int16 |
+| 运行时 | 现为 Matcha 声学 CPU + HiFi-GAN NPU；下表含早期多引擎对照 |
 | 性能数据日期 | 2026-08-11（VITS/Kokoro）；**2026-08-20（Matcha/NPU 声码器）** |
 
 > 专有名词首次出现时解释。
@@ -63,18 +63,14 @@
 cd ~/npu_demos/voice_assistant
 
 # 单独合成（默认 VITS）
-./run_tts.sh "帮我打开灯"
-./run_tts.sh -p "今天天气不错"          # 合成并播放
-./run_tts.sh -e vits -s 33 -t 2 -p "你好"
-./run_tts.sh -e matchanpu -p "识别完成"
-./run_tts.sh -e matchahifi -p "识别完成"
-./run_tts.sh -e kokoro -s 50 "你好，我是小瑞"   # 慢
+python3 tools/matcha_npu.py --text "帮我打开灯"
+python3 tools/matcha_npu.py --text "今天天气不错" --play
+python3 tools/matcha_npu.py --text "识别完成" --play
 
 # 助手：唤醒 → 识别 → TTS 回读
-./run_assistant.sh
-./run_assistant.sh --no-tts
-./run_assistant.sh --tts-engine vits
-./run_assistant.sh --tts --tts-template "好的，你说的是：{text}"
+python3 assistant_fast.py
+python3 assistant_fast.py --no-tts
+python3 assistant_fast.py --tts-template "好的，你说的是：{text}"
 ```
 
 播放：
@@ -188,7 +184,7 @@ shape inference IndexError
 |------|------|
 | `docs/TTS_说明与性能报告.md` | **本文** |
 | `docs/ASR_说明与性能报告.md` | 唤醒 + 识别 |
-| `run_tts.sh` / `deploy/run_tts.sh` | TTS CLI 封装 |
+| `tools/matcha_npu.py` | TTS（Matcha + NPU 声码器） |
 | `assistant_fast.py --tts` | 助手回读 |
 | `models/tts/` | 模型权重 |
 | `convert_kokoro_npu/` | NPU 尝试目录与 `logs/` |
