@@ -156,10 +156,24 @@ def text_to_sentences(text: str, t2i: dict[str, int], word2ids: dict[str, list[i
     return sentences
 
 
-def run_acoustic(ids: np.ndarray, onnx_path: Path, speed: float = 1.0):
+_ORT_SESS = None
+_ORT_PATH = None
+
+
+def get_acoustic_session(onnx_path: Path):
+    """Load Matcha ONNX once; creating a session each utterance is ~several seconds."""
+    global _ORT_SESS, _ORT_PATH
     import onnxruntime as ort
 
-    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    path = str(onnx_path)
+    if _ORT_SESS is None or _ORT_PATH != path:
+        _ORT_SESS = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        _ORT_PATH = path
+    return _ORT_SESS
+
+
+def run_acoustic(ids: np.ndarray, onnx_path: Path, speed: float = 1.0):
+    sess = get_acoustic_session(onnx_path)
     feeds = {}
     for inp in sess.get_inputs():
         name = inp.name

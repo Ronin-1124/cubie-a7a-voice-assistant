@@ -2,7 +2,7 @@
 
 硬件：Radxa Cubie A7A / 全志 A733 VIP9000。板端：`~/npu_demos/voice_assistant`。
 
-运行时只有 NPU 路径：KWS NBG、ASR NBG、TTS 声码器 NBG。VIP **互斥**，助手在 ASR / 声码器前会卸掉其它 NBG。
+运行时只有 NPU 路径：KWS、ASR、声码器三个 NBG **启动时一次加载并常驻**（单核 VIP 上分时 `run`，不再每次卸掉重建）。Matcha 声学仍在 CPU。
 
 ```text
 3.5mm HS-MIC (MIC4)

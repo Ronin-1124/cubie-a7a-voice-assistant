@@ -124,51 +124,119 @@ class HighPass:
 
 
 class AlsaMic:
-    """Capture AC101B stereo PCM, keep the live jack-mic slot, apply gain."""
+    """Capture AC101B stereo PCM, keep the live jack-mic slot, apply gain.
+
+    Direct hw:0,0 capture often blocks after the headphone jack is inserted
+    because Pulse suspends the card and I2S BCLK stops. Prefer Pulse, and
+    keep a silent playback running so the codec clock stays up.
+    """
 
     def __init__(self, device: str):
         self.device = device
         self.proc: subprocess.Popen | None = None
+        self._clk: subprocess.Popen | None = None
         self.hp_l = HighPass()
         self.hp_r = HighPass()
         self.gain = float(os.environ.get("MIC_GAIN", "4"))
         self.card = codec_card()
         self.open()
 
-    def open(self) -> None:
-        self.close()
-        self.proc = subprocess.Popen(
+    def _clock_on(self) -> None:
+        if self._clk is not None and self._clk.poll() is None:
+            return
+        subprocess.run(
+            ["pactl", "suspend-source", "@DEFAULT_SOURCE@", "0"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["pactl", "suspend-sink", "@DEFAULT_SINK@", "0"],
+            capture_output=True,
+        )
+        self._clk = subprocess.Popen(
             [
-                "arecord",
+                "aplay",
+                "-q",
                 "-D",
-                f"hw:{self.card},0",
+                "pulse",
                 "-f",
                 "S16_LE",
-                "-r",
-                str(SAMPLE_RATE),
                 "-c",
                 "2",
+                "-r",
+                "16000",
                 "-t",
                 "raw",
-                "-q",
             ],
-            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=0,
         )
+        z = b"\x00" * (16000 * 2 * 2 // 10)
 
-    def close(self) -> None:
-        if self.proc is None:
-            return
-        try:
-            self.proc.send_signal(signal.SIGINT)
-            self.proc.wait(timeout=1)
-        except Exception:
+        def _feed() -> None:
+            while self._clk and self._clk.stdin:
+                try:
+                    self._clk.stdin.write(z)
+                    self._clk.stdin.flush()
+                except BrokenPipeError:
+                    break
+
+        threading.Thread(target=_feed, daemon=True).start()
+
+    def open(self) -> None:
+        self.close()
+        self._clock_on()
+        for dev in ("pulse", f"plughw:{self.card},0", f"hw:{self.card},0"):
+            proc = subprocess.Popen(
+                [
+                    "arecord",
+                    "-D",
+                    dev,
+                    "-f",
+                    "S16_LE",
+                    "-r",
+                    str(SAMPLE_RATE),
+                    "-c",
+                    "2",
+                    "-t",
+                    "raw",
+                    "-q",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            time.sleep(0.15)
+            if proc.poll() is None:
+                self.proc = proc
+                return
             try:
-                self.proc.kill()
+                proc.kill()
             except Exception:
                 pass
-        self.proc = None
+        raise RuntimeError("arecord failed to open pulse/plughw/hw")
+
+    def close(self) -> None:
+        if self.proc is not None:
+            try:
+                self.proc.send_signal(signal.SIGINT)
+                self.proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        if self._clk is not None:
+            try:
+                if self._clk.stdin:
+                    self._clk.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._clk.kill()
+            except Exception:
+                pass
+            self._clk = None
 
     def read(self, n_samples: int = 1600) -> np.ndarray:
         assert self.proc and self.proc.stdout
@@ -356,6 +424,10 @@ class NpuKws:
         except queue.Empty:
             return None
 
+    def drain_hits(self) -> None:
+        while self.poll_hit() is not None:
+            pass
+
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
@@ -490,6 +562,121 @@ class NpuAsr:
         self.proc = None
 
 
+class NpuVocoder:
+    """Persistent tts_demo_a733 --stdin: NBG stays loaded, mel chunks in, pcm out."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self._err_tail: list[str] = []
+        self.n_in = 0
+        self.n_out = 0
+        self.start()
+
+    def start(self) -> None:
+        self.stop()
+        home = Path.home()
+        demo = home / "npu_demos" / "tts_demo_linux_a733" / "tts_demo_a733"
+        nb = None
+        for p in (
+            home / "npu_demos" / "tts_demo_linux_a733" / "model" / "vocoder_int16_a733.nb",
+            ROOT / "models" / "tts" / "vocoder_int16_a733.nb",
+            ROOT / "prebuilt" / "vocoder" / "vocoder_int16_a733.nb",
+        ):
+            if p.is_file():
+                nb = p
+                break
+        if not demo.is_file() or nb is None:
+            raise FileNotFoundError(f"missing vocoder demo={demo} nb={nb}")
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = f"{demo.parent / 'lib'}:{env.get('LD_LIBRARY_PATH', '')}"
+        self.proc = subprocess.Popen(
+            [str(demo), "-nb", str(nb), "--stdin"],
+            cwd=str(demo.parent),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            bufsize=0,
+        )
+        threading.Thread(target=self._read_err, daemon=True).start()
+        assert self.proc.stdout
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            s = line.decode("utf-8", "replace").strip()
+            if s.startswith("VOC_READY"):
+                parts = dict(
+                    kv.split("=", 1) for kv in s.split()[1:] if "=" in kv
+                )
+                self.n_in = int(parts.get("in", "0"))
+                self.n_out = int(parts.get("out", "0"))
+                return
+        tail = "".join(self._err_tail[-20:])
+        self.stop()
+        raise RuntimeError(f"NPU vocoder not ready (no VOC_READY)\n{tail}")
+
+    def _read_err(self) -> None:
+        assert self.proc and self.proc.stderr
+        while True:
+            line = self.proc.stderr.readline()
+            if not line:
+                break
+            self._err_tail.append(line.decode("utf-8", "replace"))
+            if len(self._err_tail) > 80:
+                self._err_tail = self._err_tail[-40:]
+
+    def run(self, mel: np.ndarray) -> np.ndarray:
+        if not self.proc or not self.proc.stdin or not self.proc.stdout:
+            raise RuntimeError("NPU vocoder process not running")
+        flat = np.ascontiguousarray(mel, dtype=np.float32).reshape(-1)
+        if self.n_in and flat.size != self.n_in:
+            raise RuntimeError(f"vocoder mel size {flat.size} != {self.n_in}")
+        n = struct.pack("<I", flat.size)
+        try:
+            self.proc.stdin.write(n + flat.tobytes())
+            self.proc.stdin.flush()
+        except BrokenPipeError as e:
+            raise RuntimeError("NPU vocoder stdin closed") from e
+        def _read_exact(n: int) -> bytes:
+            buf = bytearray()
+            while len(buf) < n:
+                chunk = self.proc.stdout.read(n - len(buf))
+                if not chunk:
+                    raise RuntimeError("NPU vocoder stdout closed")
+                buf.extend(chunk)
+            return bytes(buf)
+
+        hdr = _read_exact(4)
+        nout = struct.unpack("<I", hdr)[0]
+        raw = _read_exact(nout * 4)
+        return np.frombuffer(raw, dtype=np.float32).copy()
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.write(struct.pack("<I", 0))
+                self.proc.stdin.flush()
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.send_signal(signal.SIGTERM)
+            self.proc.wait(timeout=3)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+
+
 def ac_rms(samples: np.ndarray) -> float:
     """RMS after removing DC (this board has large DC bias)."""
     x = samples - float(np.mean(samples))
@@ -514,12 +701,9 @@ def wait_wake(
                 return ""
         else:
             idle = 0
-        e = ac_rms(samples)
         hit = npu_kws.poll_hit()
         if hit:
             return hit
-        if e < min_energy:
-            continue
         npu_kws.feed(samples)
         hit = npu_kws.poll_hit()
         if hit:
@@ -553,6 +737,8 @@ def recognize_command_npu(
         samples = mic.read(chunk)
         npu_asr.feed(samples)
         n_samples += int(samples.size)
+        if getattr(mic, "eof", False):
+            break
         e = ac_rms(samples)
         if e >= min_energy:
             voiced = True
@@ -568,34 +754,40 @@ def recognize_command_npu(
     return npu_asr.end_utt().strip()
 
 
-def speak_tts(text: str, play: bool = True) -> str | None:
-    """Matcha-baker CPU acoustic + HiFi-GAN v2 NPU vocoder."""
+def speak_tts(text: str, vocoder: NpuVocoder, play: bool = True) -> str | None:
+    """Matcha-baker CPU acoustic + resident NPU vocoder."""
     if not text.strip():
         return None
-    script = ROOT / "tools" / "matcha_npu.py"
-    if not script.is_file():
-        log(f"matcha_npu.py missing under {ROOT / 'tools'}")
+    sys.path.insert(0, str(ROOT / "tools"))
+    import matcha_npu as m  # noqa: E402
+
+    t2i = m.load_tokens(m.TTS / "matcha-icefall-zh-baker" / "tokens.txt")
+    word2ids = m.load_lexicon(m.TTS / "matcha-icefall-zh-baker" / "lexicon.txt", t2i)
+    sentences = m.text_to_sentences(text, t2i, word2ids)
+    acoustic = m.TTS / "matcha-icefall-zh-baker" / "model-steps-3.onnx"
+    if not acoustic.is_file() or not sentences:
+        log("TTS acoustic/g2p missing")
+        return None
+    t0 = time.time()
+    parts: list[np.ndarray] = []
+    for ids in sentences:
+        mel, _ = m.run_acoustic(ids, acoustic)
+        chunks, t_frames = m.pad_or_chunk(mel)
+        kept = 0
+        for ch in chunks:
+            w = vocoder.run(ch)
+            take = min(len(w), min(m.MEL_FRAMES, t_frames - kept) * m.HOP)
+            parts.append(w[:take])
+            kept += m.MEL_FRAMES
+    wav = np.concatenate(parts) if parts else None
+    if wav is None or wav.size == 0:
+        log("TTS fail (empty vocoder)")
         return None
     out_dir = ROOT / "tts_out"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"reply_{int(time.time())}.wav"
-    cmd = [
-        sys.executable,
-        str(script),
-        "--text",
-        text,
-        "-o",
-        str(out),
-        "--vocoder",
-        "npu",
-    ]
-    t0 = time.time()
-    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
-    dt = time.time() - t0
-    if r.returncode != 0 or not out.is_file():
-        log(f"TTS fail ({dt:.1f}s)")
-        return None
-    log(f"TTS {dt:.1f}s")
+    m.write_wav(out, wav)
+    log(f"TTS {time.time() - t0:.1f}s")
     if play:
         play_wav_file(out)
     return str(out)
@@ -612,9 +804,9 @@ def main() -> int:
     )
     ap.add_argument("--keywords", default=str(ROOT / "keywords_wake.txt"))
     ap.add_argument("--chunk-ms", type=int, default=100)
-    ap.add_argument("--silence", type=float, default=0.8)
+    ap.add_argument("--silence", type=float, default=0.55)
     ap.add_argument("--max-cmd-seconds", type=float, default=8.0)
-    ap.add_argument("--skip-ms", type=int, default=400, help="discard ms after wake")
+    ap.add_argument("--skip-ms", type=int, default=250, help="discard ms after wake")
     ap.add_argument(
         "--cooldown",
         type=float,
@@ -624,8 +816,8 @@ def main() -> int:
     ap.add_argument(
         "--min-energy",
         type=float,
-        default=0.0,
-        help="AC RMS gate after HPF; 0 = feed every frame",
+        default=0.008,
+        help="AC RMS after HPF+gain; below this = silence (endpoint). Live mic idle is ~0.001",
     )
     ap.add_argument(
         "--tts",
@@ -685,7 +877,6 @@ def main() -> int:
                 return 1
             wav_paths.append(p)
         args.once = True
-        args.min_energy = 0.0
         args.skip_ms = min(args.skip_ms, 150)
         args.cooldown = 0.0
 
@@ -695,7 +886,23 @@ def main() -> int:
 
     t0 = time.time()
     npu_kws = NpuKws(npu_kws_dir, keywords)
-    npu_asr: NpuAsr | None = None
+    t_kws = time.time()
+    npu_asr = NpuAsr(npu_dir)
+    t_asr = time.time()
+    npu_voc: NpuVocoder | None = None
+    if args.tts:
+        npu_voc = NpuVocoder()
+    t_voc = time.time()
+    if args.tts:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import matcha_npu as _m  # noqa: E402
+
+        _m.get_acoustic_session(_m.TTS / "matcha-icefall-zh-baker" / "model-steps-3.onnx")
+    t1 = time.time()
+    log(
+        f"resident kws={t_kws - t0:.1f}s asr={t_asr - t_kws:.1f}s "
+        f"voc={t_voc - t_asr:.1f}s matcha={t1 - t_voc:.1f}s  ready {t1 - t0:.1f}s"
+    )
 
     if wav_paths:
         mic = WavMic(wav_paths)
@@ -703,23 +910,25 @@ def main() -> int:
         mic = AlsaMic("hw:0,0")
         mic.drain(0.5, chunk)
 
-    log(f"kws=npu asr=npu tts={'npu' if args.tts else 'off'}  ready {time.time()-t0:.1f}s")
-
     try:
         while True:
             if not npu_kws.alive():
                 log("NPU KWS died, restarting…")
                 npu_kws.start()
+            if not npu_asr.alive():
+                log("NPU ASR died, restarting…")
+                npu_asr.start()
+            if npu_voc is not None and not npu_voc.alive():
+                log("NPU vocoder died, restarting…")
+                npu_voc.start()
             kw = wait_wake(npu_kws, mic, chunk, args.min_energy)
             if not kw:
                 log("no wake, exit")
                 break
             log(f"WAKE {kw}")
+            npu_kws.drain_hits()
 
             t_asr0 = time.time()
-            npu_kws.stop()
-            if npu_asr is None or not npu_asr.alive():
-                npu_asr = NpuAsr(npu_dir)
             text = recognize_command_npu(
                 mic,
                 chunk,
@@ -731,17 +940,15 @@ def main() -> int:
             )
             t_asr1 = time.time()
             log(f"TEXT {text if text else '(empty)'}  {t_asr1 - t_asr0:.1f}s")
+            npu_kws.drain_hits()
 
-            if args.tts and text:
+            if args.tts and text and npu_voc is not None:
                 mic.close()
-                npu_kws.stop()
-                if npu_asr is not None:
-                    npu_asr.stop()
-                    npu_asr = None
                 reply = args.tts_template.format(text=text, wake=kw)
-                speak_tts(reply, play=True)
+                speak_tts(reply, npu_voc, play=True)
                 mic.open()
                 mic.drain(0.3, chunk)
+                npu_kws.drain_hits()
 
             if args.once:
                 break
@@ -752,17 +959,14 @@ def main() -> int:
             if args.tts:
                 cool = max(cool, 1.0)
             mic.drain(cool, chunk)
-            if npu_asr is not None:
-                npu_asr.stop()
-                npu_asr = None
-            if not npu_kws.alive():
-                npu_kws.start()
+            npu_kws.drain_hits()
     except KeyboardInterrupt:
         log("bye")
     finally:
         npu_kws.stop()
-        if npu_asr is not None:
-            npu_asr.stop()
+        npu_asr.stop()
+        if npu_voc is not None:
+            npu_voc.stop()
         mic.close()
     return 0
 
